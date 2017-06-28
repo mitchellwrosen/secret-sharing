@@ -19,8 +19,6 @@ module Crypto.SecretSharing.Internal
   , decodeSecret
   ) where
 
-import Math.Polynomial.Interpolation
-
 import Control.Applicative ((<$>), pure, some)
 import Control.Exception (AssertionFailed(..), throw, throwIO)
 import Data.Binary (Get)
@@ -31,6 +29,7 @@ import Data.Foldable (foldMap)
 import Data.List (transpose)
 import Data.Word (Word8)
 import GHC.Exts (build)
+import Math.Polynomial.Interpolation
 import System.Random.Dice (getDiceRolls)
 
 import qualified Data.ByteString.Lazy as ByteString
