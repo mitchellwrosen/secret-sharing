@@ -1,147 +1,139 @@
-{-# LANGUAGE DeriveDataTypeable, DeriveGeneric, GeneralizedNewtypeDeriving, TemplateHaskell #-} 
+{-# LANGUAGE DataKinds       #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TupleSections   #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Crypto.SecretSharing.Internal
 -- Copyright   :  Peter Robinson 2014
 -- License     :  LGPL
--- 
+--
 -- Maintainer  :  Peter Robinson <peter.robinson@monoid.at>
 -- Stability   :  experimental
 -- Portability :  portable
--- 
+--
 -----------------------------------------------------------------------------
 
 module Crypto.SecretSharing.Internal
-where
+  ( encodeSecret
+  , decodeSecret
+  ) where
+
 import Math.Polynomial.Interpolation
 
-import Data.ByteString.Lazy( ByteString )
-import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString.Lazy.Char8 as BLC
-import qualified Data.List as L
-import Data.Char
-import Data.Vector( Vector )
-import qualified Data.Vector as V
-import Data.Typeable
-import Control.Exception
-import Control.Monad
-import Data.Binary( Binary )
-import GHC.Generics
-import Data.FiniteField.PrimeField as PF
-import Data.FiniteField.Base(FiniteField,order)
-import System.Random.Dice
+import Control.Applicative ((<$>), pure, some)
+import Control.Exception (AssertionFailed(..), throw, throwIO)
+import Data.Binary (Get)
+import Data.Binary.Get (getWord16be, runGetOrFail)
+import Data.ByteString.Lazy.Builder (toLazyByteString, word16BE)
+import Data.ByteString.Lazy (ByteString, pack, unpack)
+import Data.Foldable (foldMap)
+import Data.List (transpose)
+import Data.Word (Word8)
+import GHC.Exts (build)
+import System.Random.Dice (getDiceRolls)
+
+import qualified Data.ByteString.Lazy as ByteString
+import qualified Data.FiniteField.PrimeField as PrimeField
+
+-- | @encodeSecret m n secret@ encodes @secret@ into @n@ shares such that any
+-- @m@ are sufficient to decode it.
+--
+-- The following preconditions must be met:
+--
+--   * @m > 1@, because if @m = 1@, each share is itself the secret.
+--
+--   * @m <= n@, because otherwise the secret could not be decoded.
+--
+--   * @m < 1021@, as a technical limitation of the underlying implementation.
+--
+-- If any of these are violatied, this function throws 'AssertionFailed' in IO.
+--
+-- /since 1.1.0/
+encodeSecret :: Int -> Int -> ByteString -> IO [ByteString]
+encodeSecret m n _ | n >= 1021 || m == 1 || m > n =
+  throwIO (AssertionFailed "encodeSecret: require m < 1021, m > 1, and m <= n")
+encodeSecret _ _ secret | ByteString.null secret = pure []
+encodeSecret m n secret = do
+  coeffs <-
+    chunksOf (m-1) . map fromIntegral <$>
+      getDiceRolls 1021 (fromIntegral (ByteString.length secret) * (m-1))
+
+  let shares :: [[Field]]
+      shares = zipWith (encodeByte n) coeffs (unpack secret)
+
+      shares' :: [(Field, [Field])]
+      shares' = zip shareIds (transpose shares)
+
+  pure (map encodeShare shares')
+
+encodeShare :: (Field, [Field]) -> ByteString
+encodeShare (x, xs) = toLazyByteString (foldMap (word16BE . fromField) (x:xs))
+
+encodeByte :: Int -> Polyn -> Word8 -> [Field]
+encodeByte n coeffs byte =
+  [ fromField (evalPolynomial (fromIntegral byte : coeffs) i)
+  | i <- take n shareIds
+  ]
+
+shareIds :: [Field]
+shareIds = map fromIntegral [(1::Int)..]
+
+-- | @decodeSecret shares@ decodes a secret with at least @m@ of @n@ shares.
+--
+-- If any share does not decode successfully, this function will throw
+-- 'AssertionFailed', which can be caught in IO using
+-- 'Control.Exception.evaluate'.
+--
+-- Note that if an insufficient number of shares are provided, or if shares from
+-- different secrets are mixed together, /some/ nonsense bytes will still be
+-- decoded.
+--
+-- /since 1.1.0/
+decodeSecret :: [ByteString] -> ByteString
+decodeSecret shares =
+  case mapM decodeShare shares of
+    Nothing -> throw (AssertionFailed "decodeSecret: decoding share failed")
+    Just shares' -> go shares'
+ where
+  go :: [(Field, [Field])] -> ByteString
+  go = pack
+     . map (fromField . decodeByte)
+     . transpose
+     . map (\(x, xs) -> map (x,) xs)
+
+decodeShare :: ByteString -> Maybe (Field, [Field])
+decodeShare bytes =
+  case runGetOrFail get bytes of
+    Right (leftover, _, share)
+      | ByteString.null leftover -> Just share
+    _ -> Nothing
+ where
+  get :: Get (Field, [Field])
+  get = do
+    x  <- getWord16be
+    xs <- some getWord16be
+    pure (fromIntegral x, map fromIntegral xs)
+
+decodeByte :: [(Field, Field)] -> Field
+decodeByte ss = polyInterp ss 0
+
+-- Copied from Data.List.Split (not worth the dependency for this one function)
+chunksOf :: Int -> [e] -> [[e]]
+chunksOf i ls = map (take i) (build (splitter ls)) where
+  splitter :: [e] -> ([e] -> a -> a) -> a -> a
+  splitter [] _ n = n
+  splitter l c n  = l `c` splitter (drop i l) c n
 
 
+type Field = $(PrimeField.primeField 1021)
 
--- | A share of an encoded byte. 
-data ByteShare = ByteShare 
-  { shareId :: !Int                  -- ^ the index of this share 
-  , reconstructionThreshold :: !Int  -- ^ number of shares required for 
-                                     -- reconstruction
-  , shareValue :: !Int        -- ^ the value of p(shareId) where p(x) is the 
-                              --   generated (secret) polynomial
-  }
-  deriving(Typeable,Eq,Generic)
+fromField :: Num a => Field -> a
+fromField = fromInteger . PrimeField.toInteger
 
-instance Show ByteShare where
-  show = show . shareValue 
+-- A polynomial over the finite field given as a list of coefficients.
+type Polyn = [Field]
 
--- | A share of the encoded secret.
-data Share = Share 
-  { theShare :: ![ByteShare] }
-  deriving(Typeable,Eq,Generic)
-
-instance Show Share where
-  show s = show (shareId $ head $ theShare s,BLC.pack $ map (chr . shareValue) $ theShare s)
-
-instance Binary ByteShare
-instance Binary Share
-
--- | Encodes a 'ByteString' as a list of n shares, m of which are required for
--- reconstruction.
--- Lives in the 'IO' to access a random source.
-encode :: Int         -- ^ m 
-       -> Int         -- ^ n
-       -> ByteString  -- ^ the secret that we want to share
-       -> IO [Share] -- a list of n-shares (per byte) 
-encode m n bstr 
-  | n >= prime || m > n = throw $ AssertionFailed $ 
-      "encode: require n < " ++ show prime ++ " and m<=n."
-  | BL.null bstr = return []
-  | otherwise = do
-  let len = max 1 ((fromIntegral $ BL.length bstr) * (m-1))
-  coeffs <- (groupInto (m-1) . map fromIntegral . take len ) 
-                            `liftM` (getDiceRolls prime len)
-  let byteVecs = zipWith (encodeByte m n) coeffs $
-                    map fromIntegral $ BL.unpack bstr 
-  return [ Share $ map (V.! (i-1)) byteVecs | i <- [1..n] ]
-
-
--- | Reconstructs a (secret) bytestring from a list of (at least @m@) shares. 
--- Throws 'AssertionFailed' if the number of shares is too small.
-decode :: [Share]    -- ^ list of at least @m@ shares
-       -> ByteString -- ^ reconstructed secret
-decode []     = BL.pack []
-decode shares@((Share s):_) 
-  | length shares < reconstructionThreshold (head s) = throw $ AssertionFailed 
-      "decode: not enough shares for reconstruction."
-  | otherwise =
-    let origLength = length s in
-    let byteVecs = map (V.fromList . theShare) shares in
-    let byteShares = [ map ((V.! (i-1))) byteVecs | i <- [1..origLength] ] in
-    BL.pack . map (fromInteger . PF.toInteger . number) 
-            . map decodeByte $ byteShares
-    
-
-encodeByte :: Int -> Int -> Polyn -> FField -> Vector ByteShare
-encodeByte m n coeffs secret = 
-  V.fromList[ ByteShare i m $ fromInteger . PF.toInteger . number $ 
-                evalPolynomial (secret:coeffs) (fromIntegral i::FField) 
-            | i <- [1..n] 
-            ]
-
-
-decodeByte :: [ByteShare] -> FField
-decodeByte ss =
-  let m = reconstructionThreshold $ head ss in
-  if length ss < m
-    then throw $ AssertionFailed "decodeByte: insufficient number of shares for reconstruction!"
-    else
-      let shares = take m ss 
-          pts = map (\s -> (fromIntegral $ shareId s,fromIntegral $ shareValue s)) 
-                    shares 
-      in
-      polyInterp pts 0
-
-
--- | Groups a list into blocks of certain size. Running time: /O(n)/
-groupInto :: Int -> [a] -> [[a]]
-groupInto num as
-  | num < 0  = throw $ AssertionFailed "groupInto: Need positive number as argument."
-  | otherwise = 
-    let (fs,ss) = L.splitAt num as in
-    if L.null ss 
-      then [fs]
-      else fs : groupInto num ss 
-
-
--- | A finite prime field. All computations are performed in this field.
-newtype FField = FField { number :: $(primeField $ fromIntegral 1021) }
-  deriving(Show,Read,Ord,Eq,Num,Fractional,Generic,Typeable,FiniteField)
-  
-
--- | The size of the finite field
-prime :: Int
-prime = fromInteger $ order (0 :: FField)
-
-
--- | A polynomial over the finite field given as a list of coefficients.
-type Polyn = [FField] 
-
--- | Evaluates the polynomial at a given point.
-evalPolynomial :: Polyn -> FField -> FField
-evalPolynomial coeffs x =
-  foldr (\c res -> c + (x * res)) 0 coeffs
---  let clist = zipWith (\pow c -> (\x -> c * (x^pow))) [0..] coeffs 
---  in L.foldl' (+) 0 [ c x | c <- clist ]
-
+-- Evaluates the polynomial at a given point.
+evalPolynomial :: Polyn -> Field -> Field
+evalPolynomial coeffs x = foldr (\c res -> c + (x * res)) 0 coeffs

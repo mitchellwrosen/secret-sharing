@@ -1,0 +1,7 @@
+resolver: lts-8.20
+packages:
+- '.'
+extra-deps:
+- dice-entropy-conduit-1.0.0.1
+- finite-field-0.9.0
+- polynomial-0.7.3
