@@ -1,39 +1,55 @@
+{-# LANGUAGE BangPatterns               #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 -- | Arithmetic over GF(256), using 0x1D as the irreducible polynomial.
 
 module Data.Gf256
-  ( Gf256
+  ( Gf256(..)
   ) where
 
-import Control.Monad (forM_)
-import Control.Monad.ST (ST)
 import Data.Bits
-import Data.Vector (Vector)
+import Data.Vector.Primitive (Vector, (!))
 import Data.Word
+import Foreign.Storable (Storable)
 
-import Data.Vector.Primitive ((!))
 import qualified Data.Vector.Primitive as V
-import qualified Data.Vector.Primitive.Mutable as MV
 
 newtype Gf256
   = Gf256 Word8
+  deriving (Eq, Show, Storable)
 
 instance Num Gf256 where
   Gf256 x + Gf256 y = Gf256 (xor x y)
   Gf256 x - Gf256 y = Gf256 (xor x y)
-  Gf256 x * Gf256 y = Gf256 (mul x y)
+  Gf256 x * Gf256 y = Gf256 (mulGf256 x y)
   negate x = x
   abs (Gf256 x) = Gf256 (abs x)
   signum (Gf256 x) = Gf256 (signum x)
   fromInteger n = Gf256 (fromInteger n)
 
-mul :: Word8 -> Word8 -> Word8
-mul 0 y = y
-mul x 0 = x
-mul x y =
-  exps ! fromIntegral ((logs ! fromIntegral x) + (logs ! fromIntegral y))
+instance Fractional Gf256 where
+  fromRational = error "Data.Gf256: no fromRational"
+  Gf256 x / Gf256 y = Gf256 (divGf256 x y)
 
--- [1, x, x^2, x^3, ..., x^255]
-exps :: V.Vector Word8
+mulGf256 :: Word8 -> Word8 -> Word8
+mulGf256 0 _ = 0
+mulGf256 _ 0 = 0
+mulGf256 x y =
+  let x', y' :: Word16
+      !x' = fromIntegral (logs ! fromIntegral x)
+      !y' = fromIntegral (logs ! fromIntegral y)
+  in exps ! fromIntegral ((x' + y') `mod` 255)
+
+divGf256 :: Word8 -> Word8 -> Word8
+divGf256 _ 0 = error "Data.Gf256: divide by 0"
+divGf256 x y =
+  let x', y' :: Word16
+      !x' = fromIntegral (logs ! fromIntegral x) + 255
+      !y' = fromIntegral (logs ! fromIntegral y)
+  in exps ! fromIntegral ((x' - y') `mod` 255)
+
+-- [1, x, x^2, x^3, ..., x^254]
+exps :: Vector Word8
 exps = V.fromList
   [ 1, 2, 4, 8, 16, 32, 64, 128, 29, 58, 116, 232, 205, 135, 19, 38, 76, 152, 45
   , 90, 180, 117, 234, 201, 143, 3, 6, 12, 24, 48, 96, 192, 157, 39, 78, 156
@@ -50,10 +66,12 @@ exps = V.fromList
   , 28, 56, 112, 224, 221, 167, 83, 166, 81, 162, 89, 178, 121, 242, 249, 239
   , 195, 155, 43, 86, 172, 69, 138, 9, 18, 36, 72, 144, 61, 122, 244, 245, 247
   , 243, 251, 235, 203, 139, 11, 22, 44, 88, 176, 125, 250, 233, 207, 131, 27
-  , 54, 108, 216, 173, 71, 142, 1
+  , 54, 108, 216, 173, 71, 142
   ]
 
-logs :: V.Vector Word8
+-- @logs ! 0@ is undefined, but this is an unboxed vector, so we must put some
+-- byte there.
+logs :: Vector Word8
 logs = V.fromList
   [ 0, 0, 1, 25, 2, 50, 26, 198, 3, 223, 51, 238, 27, 104, 199, 75, 4, 100, 224
   , 14, 52, 141, 239, 129, 28, 193, 105, 248, 200, 8, 76, 113, 5, 138, 101, 47
@@ -76,13 +94,19 @@ logs = V.fromList
 -- This code was used to generate the vectors above:
 
 {--
-exps :: V.Vector Word8
-exps = V.iterateN 256 xtimes 1
+import Control.Monad (forM_)
+import Control.Monad.ST (ST)
+import Data.Vector.Primitive (MVector)
 
-logs :: V.Vector Word8
-logs = V.create go
+import qualified Data.Vector.Primitive.Mutable as MV
+
+exps' :: Vector Word8
+exps' = V.iterateN 255 xtimes 1
+
+logs' :: Vector Word8
+logs' = V.create go
  where
-  go :: ST s (V.MVector s Word8)
+  go :: ST s (MVector s Word8)
   go = do
     v <- MV.new 256
     forM_ [0..254] $ \i -> do

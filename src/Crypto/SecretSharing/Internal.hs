@@ -1,6 +1,6 @@
-{-# LANGUAGE DataKinds       #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TupleSections   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections       #-}
+{-# LANGUAGE ViewPatterns        #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -14,26 +14,29 @@
 --
 -----------------------------------------------------------------------------
 
-module Crypto.SecretSharing.Internal
-  ( encodeSecret
-  , decodeSecret
-  ) where
+module Crypto.SecretSharing.Internal where
 
-import Control.Applicative ((<$>), pure, some)
-import Control.Exception (AssertionFailed(..), throw, throwIO)
-import Data.Binary (Get)
-import Data.Binary.Get (getWord16be, runGetOrFail)
-import Data.ByteString.Lazy.Builder (toLazyByteString, word16BE)
-import Data.ByteString.Lazy (ByteString, pack, unpack)
-import Data.Foldable (foldMap)
+import Control.Applicative ((<$>), pure)
+import Control.Exception (mask)
+import Control.Monad
+import Control.Monad.CIO
+import Control.Monad.IO.Class
+import Data.ByteString (ByteString, pack, unpack)
+import Data.ByteString.Unsafe (unsafePackMallocCStringLen, unsafeUseAsCString)
+import Data.Coerce (coerce)
+import Data.Gf256
 import Data.List (transpose)
+import Data.Vector (Vector, (!))
 import Data.Word (Word8)
-import GHC.Exts (build)
-import Math.Polynomial.Interpolation
-import System.Random.Dice (getDiceRolls)
+import Foreign.C.Types (CChar)
+import Foreign.Marshal.Alloc
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr
+import Foreign.Storable
+import System.Random
 
-import qualified Data.ByteString.Lazy as ByteString
-import qualified Data.FiniteField.PrimeField as PrimeField
+import qualified Data.ByteString as ByteString
+import qualified Data.Vector as Vector
 
 -- | @encodeSecret m n secret@ encodes @secret@ into @n@ shares such that any
 -- @m@ are sufficient to decode it.
@@ -44,39 +47,82 @@ import qualified Data.FiniteField.PrimeField as PrimeField
 --
 --   * @m <= n@, because otherwise the secret could not be decoded.
 --
---   * @m < 1021@, as a technical limitation of the underlying implementation.
+-- If either of these are violatied, this function throws 'AssertionFailed' in
+-- IO.
 --
--- If any of these are violatied, this function throws 'AssertionFailed' in IO.
---
--- /since 1.1.0/
-encodeSecret :: Int -> Int -> ByteString -> IO [ByteString]
-encodeSecret m n _ | n >= 1021 || m == 1 || m > n =
-  throwIO (AssertionFailed "encodeSecret: require m < 1021, m > 1, and m <= n")
-encodeSecret _ _ secret | ByteString.null secret = pure []
-encodeSecret m n secret = do
-  coeffs <-
-    chunksOf (m-1) . map fromIntegral <$>
-      getDiceRolls 1021 (fromIntegral (ByteString.length secret) * (m-1))
+-- /since 2.0/
+encodeSecret :: Word8 -> Word8 -> ByteString -> IO [ByteString]
+encodeSecret m n secret = lower $ do
+  secret_ptr :: Ptr Gf256 <-
+    mutableShare secret
 
-  let shares :: [[Field]]
-      shares = zipWith (encodeByte n) coeffs (unpack secret)
+  -- Allocate memory for each share (length of secret + 1 byte for share number)
 
-      shares' :: [(Field, [Field])]
-      shares' = zip shareIds (transpose shares)
+  shares :: Vector ByteString <-
+    Vector.generateM ni
+      (\i -> liftIO $ do
+        mask $ \restore -> do
+          -- With async exceptions masked, malloc the share and associate it
+          -- with a free finalizer (non-atomically).
 
-  pure (map encodeShare shares')
+          ptr :: Ptr CChar <-
+            mallocBytes (len + 1)
 
-encodeShare :: (Field, [Field]) -> ByteString
-encodeShare (x, xs) = toLazyByteString (foldMap (word16BE . fromField) (x:xs))
+          share :: ByteString <-
+            unsafePackMallocCStringLen (ptr, len + 1)
 
-encodeByte :: Int -> Polyn -> Word8 -> [Field]
-encodeByte n coeffs byte =
-  [ fromField (evalPolynomial (fromIntegral byte : coeffs) i)
-  | i <- take n shareIds
-  ]
+          restore $ do
+            poke ptr (fromIntegral (i+1))
+            pure share)
 
-shareIds :: [Field]
-shareIds = map fromIntegral [(1::Int)..]
+  -- Get a mutable view of the shares
+
+  share_ptrs :: Vector (Ptr Gf256) <-
+    traverse mutableShare shares
+
+  liftIO $ do
+    -- (m-1) random coefficients for each byte of the secret
+    coeffs :: Vector Gf256 <-
+      liftIO (Vector.replicateM ((mi - 1) * len) (Gf256 <$> randomIO))
+
+    --               m-1
+    --   [ 1^1, 1^2, 1^3, 1^4, ... ]
+    -- n [ 2^1, 2^2, 2^3, 2^4, ... ]
+    --   [ 3^1, 3^2, 3^3, 3^4, ... ]
+    --   [ ...                     ]
+    let indeterminates :: Vector (Vector Gf256)
+        indeterminates =
+          Vector.generate ni
+            (\(fromIntegral . succ -> i) -> Vector.iterateN (mi - 1) (* i) i)
+
+    -- Loop over each byte of the secret
+    forM_ [0..len-1] $ \i -> do
+      -- Slice (m-1) coefficients for byte i, which begin at index i*(m-1)
+      let cs :: Vector Gf256
+          cs = Vector.slice (i * (mi - 1)) (mi - 1) coeffs
+
+      x <- peekByteOff secret_ptr i
+
+      -- Evaluate each byte share
+      forM_ [0..n-1] $ \(fromIntegral -> j) -> do
+        let y = Vector.sum (Vector.zipWith (*) cs (indeterminates ! j))
+        pokeByteOff (share_ptrs ! j) (i+1) (x+y)
+
+    pure (Vector.toList shares)
+
+  where
+    len :: Int
+    len = ByteString.length secret
+
+    mi :: Int
+    mi = fromIntegral m
+
+    ni :: Int
+    ni = fromIntegral n
+
+mutableShare :: ByteString -> CIO (Ptr Gf256)
+mutableShare share =
+  CIO (\k -> unsafeUseAsCString share (k . castPtr))
 
 -- | @decodeSecret shares@ decodes a secret with at least @m@ of @n@ shares.
 --
@@ -88,51 +134,22 @@ shareIds = map fromIntegral [(1::Int)..]
 -- different secrets are mixed together, /some/ nonsense bytes will still be
 -- decoded.
 --
--- /since 1.1.0/
+-- /since 2.0/
 decodeSecret :: [ByteString] -> ByteString
-decodeSecret shares =
-  case mapM decodeShare shares of
-    Nothing -> throw (AssertionFailed "decodeSecret: decoding share failed")
-    Just shares' -> go shares'
- where
-  go :: [(Field, [Field])] -> ByteString
-  go = pack
-     . map (fromField . decodeByte)
-     . transpose
-     . map (\(x, xs) -> map (x,) xs)
+decodeSecret =
+    pack
+  . map (coerce . interp)
+  . transpose
+  . map (go . coerce . unpack)
+  where
+    go :: [Gf256] -> [(Gf256, Gf256)]
+    go (x:xs) = map (x,) xs
 
-decodeShare :: ByteString -> Maybe (Field, [Field])
-decodeShare bytes =
-  case runGetOrFail get bytes of
-    Right (leftover, _, share)
-      | ByteString.null leftover -> Just share
-    _ -> Nothing
- where
-  get :: Get (Field, [Field])
-  get = do
-    x  <- getWord16be
-    xs <- some getWord16be
-    pure (fromIntegral x, map fromIntegral xs)
+interp :: [(Gf256, Gf256)] -> Gf256
+interp (zip [(0::Int)..] -> vals) = sum $ do
+  (i, (xi, yi)) <- vals
 
-decodeByte :: [(Field, Field)] -> Field
-decodeByte ss = polyInterp ss 0
-
--- Copied from Data.List.Split (not worth the dependency for this one function)
-chunksOf :: Int -> [e] -> [[e]]
-chunksOf i ls = map (take i) (build (splitter ls)) where
-  splitter :: [e] -> ([e] -> a -> a) -> a -> a
-  splitter [] _ n = n
-  splitter l c n  = l `c` splitter (drop i l) c n
-
-
-type Field = $(PrimeField.primeField 1021)
-
-fromField :: Num a => Field -> a
-fromField = fromInteger . PrimeField.toInteger
-
--- A polynomial over the finite field given as a list of coefficients.
-type Polyn = [Field]
-
--- Evaluates the polynomial at a given point.
-evalPolynomial :: Polyn -> Field -> Field
-evalPolynomial coeffs x = foldr (\c res -> c + (x * res)) 0 coeffs
+  let p = product [ xj / (xi - xj) | (j, (xj, _)) <- vals
+                                   , i /= j
+                                   ]
+  [yi * p]

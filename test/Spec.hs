@@ -4,7 +4,8 @@ import Crypto.SecretSharing
 
 import Control.Applicative ((<$>))
 import Control.Monad (forM_)
-import Data.ByteString.Lazy (pack)
+import Data.ByteString (pack)
+import Data.Word (Word8)
 import Test.Hspec
 import Test.Hspec.Core.Runner (Config(..), defaultConfig, hspecWith)
 import Test.Hspec.QuickCheck (prop)
@@ -30,7 +31,8 @@ spec = do
         assert (decodeSecret shares' == secret)
 
 -- All ways to choose n elements
-combinations :: Int -> [a] -> [[a]]
+combinations :: Word8 -> [a] -> [[a]]
 combinations _ [] = []
 combinations 0 _ = [[]]
+combinations 1 xs = map pure xs
 combinations n (x:xs) = map (x:) (combinations (n-1) xs) ++ combinations n xs
